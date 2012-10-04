@@ -2,7 +2,8 @@
 
 var udp = require('dgram'),
     sys = require('util'),
-    exec = require('child_process').exec;
+    exec = require('child_process').exec,
+    fs = require('fs');
 
 var node = process.argv.shift();
 var file = process.argv.shift();
@@ -13,90 +14,200 @@ process.argv.unshift(node);
 
 // Grab our configuration, load it, and update the hostname if need be.
 var config = require(configFile).config;
-if (!config.hostname) {
-    // We have no hostname, so call 'hostname --short' to grab it.
-    exec("hostname --short", function (e, sio, se) {
-        if(typeof sio != 'undefined' && sio.length > 0) {
-            var hostname = sio.replace(/[\s\r\n]+$/, '');
-            config.hostname = hostname;
-        }
 
+// Some synchronization primitives to make coalescing multiple async callbacks
+// a weeee bit easier.
+var runningTasks = 0;
+
+function taskStarted(command) { runningTasks++; }
+function taskFinished(command) { runningTasks--; }
+function tasksRunning() { return runningTasks > 0; }
+function whenTasksComplete(callback) {
+    // Polling every 10ms seems to be speedy enough and doesn't hurt us
+    // performance wise.
+    setTimeout(function() {
+        if(tasksRunning()) {
+            setTimeout(function() {
+                whenTasksComplete(callback);
+            }, 10);
+        } else {
+            callback();
+        }
+    }, 10);
+}
+
+function makeWrappedExecCall(command, successHandler, errorHandler) {
+    // If we didn't get an error handler, just spit the error to console.
+    if(typeof errorHandler == 'undefined') {
+        errorHandler = function(err) { sys.log(err); };
+    }
+
+    taskStarted(command);
+
+    exec(command, function (e, sio, se) {
         if(typeof se != 'undefined' && se.length > 0) {
-            sys.log('[err] ' + se);
+            errorHandler(se);
+            taskFinished(command);
+        } else {
+            successHandler(sio);
+            taskFinished(command);
         }
     });
 }
 
-// Define our main loop.  We call vmstat, get our stuff, then we build an object
-// to send to our collector which is then passed off to listening clients.  We do
-// this over UDP so we can avoid dealing with ugly error handling and network
-// problems.  The collector and clients are set up to deal with data loss so we
-// concentrate on simply pushing out stats when possible. :)
-function run(config, exec, udp, sys) {
-    exec("vmstat 1 2", function(e, sio, se) {
-        if(typeof sio != 'undefined'  && sio.length > 0) {
-            var vmstatSplit = sio.split("\n");
+function makeWrappedFileRead(path, successHandler, errorHandler) {
+    // If we didn't get an error handler, just spit the error to console.
+    if(typeof errorHandler == 'undefined') {
+        errorHandler = function(err) { sys.log(err); };
+    }
 
-            var statLine = vmstatSplit[3]
+    taskStarted();
+
+    fs.readFile(path, function(err, data) {
+        if(err) {
+            errorHandler(err);
+            taskFinished();
+        } else {
+            successHandler(data);
+            taskFinished();
+        }
+    });
+}
+
+function getHostname() {
+    sys.log("Getting our hostname...");
+
+    // Try and get our hostname.
+    makeWrappedExecCall("hostname --short",
+        function(data) {
+            var hostname = data.replace(/[\s\r\n]+$/, '');
+            config.hostname = hostname;
+        },
+        function() {
+            // We got back an error... which probably means we simply couldn't
+            // get a short name.  This happens sometimes, no biggie.
+            makeWrappedExecCall("hostname",
+                function(data) {
+                    // Nailed it!
+                    var hostname = data.replace(/[\s\r\n]+$/, '');
+                    config.hostname = hostname;
+                },
+                function(err) {
+                    // Well this sucks.  Print the error and let's exit.
+                    sys.log(err);
+
+                    process.exit(1);
+                }
+            );
+        }
+    );
+}
+
+function getCpuCoreCount() {
+    sys.log("Getting our core count...");
+}
+
+function sendNodeData(nodeData)
+{
+    var nodeDataJson = JSON.stringify(nodeData);
+    var payload = new Buffer(nodeDataJson.toString('utf8'));
+
+    var client = udp.createSocket('udp4');
+    client.send(payload, 0, payload.length, config.collectorPort, config.collectorHost, function() {
+        client.close();
+    });
+}
+
+function run() {
+    var nodeInfo = { name: config.hostname };
+
+    makeWrappedExecCall("vmstat 1 2", function(data) {
+        var vmstatSplit = data.split("\n");
+
+        var statLine = vmstatSplit[3]
+            .replace("\t", ' ')
+            .replace(/ +/g, ' ')
+            .replace(/^\s+|\s+$/g, '')
+            .split(' ');
+        var cpuIdleTime = statLine[14];
+
+        nodeInfo.cpuUsage = (100 - cpuIdleTime);
+    });
+
+    // Now get our load averages.
+    makeWrappedFileRead("/proc/loadavg", function(data) {
+        if(typeof data != 'undefined' && data.length > 0) {
+            var uptimeSplit = data
+                .toString('ascii')
                 .replace("\t", ' ')
                 .replace(/ +/g, ' ')
                 .replace(/^\s+|\s+$/g, '')
                 .split(' ');
-            var cpuIdleTime = statLine[14];
 
-            // Now get our load averages.
-            exec("uptime", function(e2, sio2, se2) {
-                if(typeof sio2 != 'undefined'  && sio2.length > 0) {
+            var oneMinLoadAvg = uptimeSplit[0].replace(',', '');
+            var fiveMinLoadAvg = uptimeSplit[1].replace(',', '');
+            var fifteenMinLoadAvg = uptimeSplit[2].replace(',', '');
 
-                    var uptimeSplit = sio2
-                        .replace("\t", ' ')
-                        .replace(/ +/g, ' ')
-                        .replace(/^\s+|\s+$/g, '')
-                        .split(' ');
-
-                    var oneMinLoadAvg = uptimeSplit[9].replace(',', '');
-                    var fiveMinLoadAvg = uptimeSplit[10].replace(',', '');
-                    var fifteenMinLoadAvg = uptimeSplit[11].replace(',', '');
-
-                    var nodeInfo = {
-                        name: config.hostname,
-                        cpuUsage: (100 - cpuIdleTime),
-                        loadAvg: {
-                            oneMinute: oneMinLoadAvg,
-                            fiveMinutes: fiveMinLoadAvg,
-                            fifteenMinutes: fifteenMinLoadAvg
-                        }
-                    };
-
-                    var nodeInfoString = JSON.stringify(nodeInfo);
-
-                    sys.log(nodeInfoString);
-
-                    var payload = new Buffer(nodeInfoString.toString('utf8'));
-
-                    var client = udp.createSocket('udp4');
-                    client.send(payload, 0, payload.length, config.collectorPort, config.collectorHost, function() {
-                        sys.log('Sent health payload to ' + config.collectorHost + ':' + config.collectorPort);
-                        client.close();
-                    });
-                }
-
-                if(typeof se2 != 'undefined' && se2.length > 0) {
-                    sys.log('[err] ' + se2);
-                }
-            });
+            nodeInfo.loadAvg = {
+                oneMinute: oneMinLoadAvg,
+                fiveMinutes: fiveMinLoadAvg,
+                fifteenMinutes: fifteenMinLoadAvg
+            }
         }
+    });
 
-        if(typeof se != 'undefined' && se.length > 0) {
-            sys.log('[err] ' + se);
+    // Now get our memory numbers.
+    makeWrappedFileRead("/proc/meminfo", function(data) {
+        if(typeof data != 'undefined' && data.length > 0) {
+            var memoryInfoSplit = data
+                .toString('ascii')
+                .split("\n");
+
+            var memoryTotal = memoryInfoSplit[0]
+                .replace('kB', '')
+                .replace(/ +/g, ' ')
+                .replace(/^\s+|\s+$/g, '')
+                .split(' ');
+
+            var memoryFree = memoryInfoSplit[1]
+                .replace('kB', '')
+                .replace(/ +/g, ' ')
+                .replace(/^\s+|\s+$/g, '')
+                .split(' ');
+
+            nodeInfo.memoryUsage = {
+                memoryTotal: memoryTotal[1],
+                memoryFree: memoryFree[1]
+            }
         }
+    });
 
+    // Wait for our tasks to finish.
+    whenTasksComplete(function() {
+        // We're good - send our data.
+        sendNodeData(nodeInfo);
+
+        // Schedule our next run.
         process.nextTick(function() {
-            run(config, exec, udp, sys);
+            run();
         });
     });
 }
 
-// Start le agent.
-sys.log("Starting serverhealth...");
-run(config, exec, udp, sys);
+sys.log("Starting ServerHealth agent...");
+
+// Get the system's hostname.
+if(!config.hostname) {
+    getHostname();
+}
+
+// See how many cores we have.
+getCpuCoreCount();
+
+// Wait for running tasks to finish before starting the agent.
+whenTasksComplete(function() {
+    sys.log("Starting main loop...");
+
+    // Start the agent!
+    run();
+});
